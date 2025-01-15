@@ -1,0 +1,13 @@
+---
+- name: Update AlmaLinux 9
+  hosts: almalinux-9.x_servers
+  become: yes
+  tasks:
+    - name: Update the package repository
+      dnf:
+        name: '*'
+        state: latest
+
+    - name: Clean up unused packages
+      dnf:
+        autoremove: yes
