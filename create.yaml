@@ -1,5 +1,9 @@
 ---
-- hosts: almalinux-9.x_servers
-  become: true
-  vars:
-    created_username: sammy
+- name: Reboot AlmaLinux 9 server
+  hosts: almalinux-9.x_servers
+  become: yes
+
+  tasks:
+  - name: Reboot the server
+    ansible.builtin.reboot: 
+      reboot_timeout: 300  # Optional: Set a timeout for the reboot (in seconds) 
