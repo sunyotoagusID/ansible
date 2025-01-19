@@ -1,6 +1,8 @@
+---
+- name: os-hardening
 - hosts: all
   roles:
-    - dev-sec.os-hardening
+    - devsec.hardening.os_hardening
   vars:
     sysctl_overwrite:
       # Enable IPv4 traffic forwarding.
