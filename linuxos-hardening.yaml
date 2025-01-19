@@ -1,6 +1,5 @@
 ---
-- name: os-hardening
-- hosts: all
+- hosts: localhost
   roles:
     - devsec.hardening.os_hardening
   vars:
