@@ -1,0 +1,12 @@
+---
+- name: Security and critical Windows Updates
+  ansible.windows.win_updates:
+    category_names:
+      - SecurityUpdates
+      - CriticalUpdates
+    reject_list:
+      - Windows Malicious Software Removal Tool for Windows
+      - \d{4}-\d{2} Cumulative Update for Windows Server 2019
+      - \d{4}-\d{2} Cumulative Update for Windows Server 2022
+    reboot: true
+    
