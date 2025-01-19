@@ -1,0 +1,8 @@
+---
+- name: Apply Hardening
+  hosts: all
+  become: true
+  tasks:
+    - name: Include Hardening Role
+      include_role:
+        name: devsec.hardening
