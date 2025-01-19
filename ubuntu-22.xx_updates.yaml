@@ -1,16 +1,26 @@
 ---
-- name: Update and Upgrade Ubuntu 22.04
-  hosts: [Ubuntu_servers]
-  become: yes  # Use sudo to run commands as root
+- hosts: ubuntu_servers
+  become: true
+  become_user: root
   tasks:
-    - name: Update APT package index
-      apt:
-        update_cache: yes
+    - name: Update apt repo and cache on all Debian/Ubuntu boxes
+      apt: update_cache=yes force_apt_get=yes cache_valid_time=3600
 
-    - name: Upgrade all packages
-      apt:
-        upgrade: dist  # or 'full-upgrade' for older versions
+    - name: Upgrade all packages on servers
+      apt: upgrade=dist force_apt_get=yes
 
-    - name: Clean up unused packages
-      apt:
-        autoremove: yes
+    - name: Check if a reboot is needed on all servers
+      register: reboot_required_file
+      stat: path=/var/run/reboot-required get_md5=no
+
+    - name: Reboot the box if kernel updated
+      reboot:
+        msg: "Reboot initiated by Ansible for kernel updates"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: uptime
+      when: reboot_required_file.stat.exists
+
+      //source playbook www.cyberciti.biz
