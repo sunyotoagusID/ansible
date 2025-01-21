@@ -1,0 +1,21 @@
+---
+- name: Update Proxmox Servers
+  hosts: all
+  become: yes
+  tasks:
+    - name: Update package list
+      apt:
+        update_cache: yes
+
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+
+    - name: Ensure Proxmox is installed
+      apt:
+        name: proxmox-ve
+        state: latest
+
+    - name: Clean up old packages
+      apt:
+        autoremove: yes
