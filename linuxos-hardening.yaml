@@ -1,8 +1,7 @@
 ---
 - hosts: all
-  become: true  # Ensure that the tasks are run with elevated privileges
   roles:
-    - role: dev-sec.os-hardening
+    - devsec.hardening.os_hardening
   vars:
     sysctl_overwrite:
       # Enable IPv4 traffic forwarding.
