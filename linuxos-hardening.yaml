@@ -1,6 +1,6 @@
 ---
 - hosts: all
-become: true
+  become: true
   roles:
     - devsec.hardening.os_hardening
   vars:
