@@ -1,9 +1,5 @@
 ---
 - name: Apply Hardening
   hosts: all
-  collections:
-    - devsec.hardening
-  tasks:
-  - name: import role
-    ansible.builtin.import_role:
-      name: os_hardening
+  roles:
+    - dev-sec.os-hardening
