@@ -5,5 +5,5 @@
     - devsec.hardening
   tasks:
   - name: import role
-  ansible.builtin.import_role:
-    name: os_hardening
+    ansible.builtin.import_role:
+      name: os_hardening
