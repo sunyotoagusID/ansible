@@ -1,9 +1,9 @@
 ---
 - name: Apply Hardening
   hosts: all
-  become: yes
-  become_user: root
+  collections:
+    - devsec.hardening
   tasks:
-    - name: Include Hardening Role
-      include_role:
-        name: devsec.hardening.os_hardening
+  - name: import role
+  ansible.builtin.import_role:
+    name: os_hardening
