@@ -1,6 +1,6 @@
 ---
 - name: Update Proxmox Servers
-  hosts: proxmox_servers
+  hosts: [proxmox_servers]
   become: yes
   tasks:
     - name: Update package list
