@@ -1,5 +1,6 @@
 ---
-- hosts: Ubuntu_servers,proxmox_backup
+- hosts: Ubuntu_servers
+- hosts: proxmox_backup
   become: true
   become_user: root
   tasks:
