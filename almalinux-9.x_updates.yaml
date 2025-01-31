@@ -1,6 +1,6 @@
 ---
 - name: Update AlmaLinux 9
-  hosts: almalinux-9.x_servers
+  hosts: rhel_servers
   become: yes
   tasks:
     - name: Update the package repository
