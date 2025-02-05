@@ -3,3 +3,4 @@
   hosts: all
   roles:
     - dev-sec.os-hardening
+    - devsec.hardening.ssh_hardening
