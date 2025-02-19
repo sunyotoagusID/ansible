@@ -1,5 +1,5 @@
 ---
-- hosts: Ubuntu_servers
+- hosts: debian_servers
   become: true
   become_user: root
   tasks:
