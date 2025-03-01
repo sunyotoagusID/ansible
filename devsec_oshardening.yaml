@@ -1,4 +1,6 @@
 - hosts: all
-  become: true
+  connection: local
+  collections:
+    - devsec.hardening
   roles:
-    - name: devsec.hardening.os_hardening
+    - os_hardening
