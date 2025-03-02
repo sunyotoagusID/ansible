@@ -1,6 +1,5 @@
 - hosts: all
   BECOME : yes
-  connection: local
   collections:
     - devsec.hardening
   roles:
