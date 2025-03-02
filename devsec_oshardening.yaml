@@ -1,5 +1,5 @@
 - hosts: all
-  BECOME : yes
+  become: yes
   collections:
     - devsec.hardening
   roles:
