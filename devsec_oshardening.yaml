@@ -1,4 +1,5 @@
 - hosts: all
+  BECOME : YES
   connection: local
   collections:
     - devsec.hardening
