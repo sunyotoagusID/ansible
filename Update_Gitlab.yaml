@@ -1,0 +1,22 @@
+- name: Managed Update for GitLab Server
+  hosts: gitlab_server
+  become: true
+  tasks:
+    - name: Enable GitLab Maintenance Mode
+      shell: gitlab-ctl deploy-page up
+
+    - name: Update and Safe Upgrade
+      apt:
+        update_cache: yes
+        upgrade: safe
+        cache_valid_time: 3600
+
+    - name: Check if Reconfigure is needed
+      shell: gitlab-ctl reconfigure
+      # Opsional: jalankan ini hanya jika ada paket gitlab-ce yang terupdate
+
+    - name: Restart GitLab Services
+      shell: gitlab-ctl restart
+
+    - name: Disable Maintenance Mode
+      shell: gitlab-ctl deploy-page down
