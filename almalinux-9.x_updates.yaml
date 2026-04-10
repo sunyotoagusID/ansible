@@ -3,7 +3,7 @@
   hosts: rhel_servers
   become: yes
   tasks:
-    - name: Install only security and bugfix patches
+    - name: Install security and bugfix patches
       dnf:
         name: '*'
         security: yes
