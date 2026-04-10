@@ -1,13 +1,11 @@
 ---
-- name: Update AlmaLinux 9
+- name: Update Security AlmaLinux 9
   hosts: rhel_servers
   become: yes
   tasks:
-    - name: Update the package repository
+    - name: Install only security and bugfix patches
       dnf:
         name: '*'
+        security: yes
+        bugfix: yes
         state: latest
-
-    - name: Clean up unused packages
-      dnf:
-        autoremove: yes
