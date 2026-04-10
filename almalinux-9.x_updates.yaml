@@ -1,5 +1,5 @@
 ---
-- name: Update Security AlmaLinux 9
+- name: Update Security AlmaLinux
   hosts: rhel_servers
   become: yes
   tasks:
