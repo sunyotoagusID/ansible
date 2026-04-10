@@ -3,19 +3,11 @@
   hosts: proxmox_servers
   become: yes
   tasks:
-    - name: Update package list
+    - name: Update apt repo and cache
       apt:
         update_cache: yes
+        cache_valid_time: 3600
 
-    - name: Upgrade all packages
+    - name: Upgrade all packages (Proxmox wajib menggunakan dist)
       apt:
         upgrade: dist
-
-    - name: Ensure Proxmox is installed
-      apt:
-        name: proxmox-ve
-        state: latest
-
-    - name: Clean up old packages
-      apt:
-        autoremove: yes
