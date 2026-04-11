@@ -1,0 +1,516 @@
+---
+# =============================================================================
+# FILE    : gitlab_security_hardening.yml
+# TUJUAN  : Dijalankan SEKALI — hardening permanen server GitLab
+# SEMAPHORE TEMPLATE:
+#   Playbook  : gitlab_security_hardening.yml
+#   Arguments : (kosong)
+#   Schedule  : Tidak perlu dijadwalkan — jalankan manual sekali saja
+# =============================================================================
+# URUTAN EKSEKUSI:
+#   PHASE 0 → Pre-flight (koneksi, OS check, gitlab-ctl check)
+#   PHASE 1 → SSH Hardening
+#   PHASE 2 → Kernel / Sysctl Hardening
+#   PHASE 3 → UFW Firewall
+#   PHASE 4 → Fail2ban
+#   PHASE 5 → File Permission & Verifikasi Akhir
+# =============================================================================
+# VARIABEL SEMAPHORE ENVIRONMENT (JSON):
+# {
+#   "ansible_ssh_user"           : "ubuntu",
+#   "gitlab_package_name"        : "gitlab-ce",
+#   "ssh_permit_root_login"      : "no",
+#   "ssh_password_authentication": "no",
+#   "firewall_enabled"           : true,
+#   "fail2ban_enabled"           : true,
+#   "gitlab_allowed_ssh_networks": ["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"]
+# }
+# =============================================================================
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 0 │ PRE-FLIGHT
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 0 | Pre-flight Checks"
+  hosts: gitlab_server
+  gather_facts: true
+  any_errors_fatal: true
+
+  vars:
+    gitlab_package_name:         "{{ gitlab_package_name | default('gitlab-ce') }}"
+    gitlab_http_port:            "{{ gitlab_http_port | default(80) }}"
+    gitlab_https_port:           "{{ gitlab_https_port | default(443) }}"
+    gitlab_ssh_port:             "{{ gitlab_ssh_port | default(22) }}"
+    gitlab_allowed_ssh_networks: "{{ gitlab_allowed_ssh_networks | default(['10.0.0.0/8','172.16.0.0/12']) }}"
+    ssh_permit_root_login:       "{{ ssh_permit_root_login | default('no') }}"
+    ssh_password_authentication: "{{ ssh_password_authentication | default('no') }}"
+    ssh_max_auth_tries:          "{{ ssh_max_auth_tries | default(3) }}"
+    ssh_client_alive_interval:   "{{ ssh_client_alive_interval | default(300) }}"
+    ssh_client_alive_count_max:  "{{ ssh_client_alive_count_max | default(2) }}"
+    ssh_allowed_ciphers:         "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com"
+    ssh_allowed_macs:            "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
+    ssh_kex_algorithms:          "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256"
+    firewall_enabled:            "{{ firewall_enabled | default(true) }}"
+    fail2ban_enabled:            "{{ fail2ban_enabled | default(true) }}"
+    fail2ban_maxretry:           "{{ fail2ban_maxretry | default(5) }}"
+    fail2ban_bantime:            "{{ fail2ban_bantime | default(3600) }}"
+    fail2ban_findtime:           "{{ fail2ban_findtime | default(600) }}"
+    sysctl_harden_enabled:       "{{ sysctl_harden_enabled | default(true) }}"
+
+  tasks:
+
+    - name: "[PRE-0.1] Verifikasi koneksi SSH"
+      ping:
+
+    - name: "[PRE-0.2] Validasi OS"
+      assert:
+        that:
+          - ansible_os_family == "Debian"
+          - ansible_distribution in ["Ubuntu", "Debian"]
+          - ansible_distribution_major_version | int >= 20
+        fail_msg: >
+          OS tidak didukung: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+          Butuh Ubuntu 20.04+ atau Debian 11+.
+        success_msg: "✅ OS valid: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: "[PRE-0.3] Cek gitlab-ctl tersedia"
+      stat:
+        path: /usr/bin/gitlab-ctl
+      register: ctl_stat
+
+    - name: "[PRE-0.4] Fail jika GitLab tidak terinstall"
+      fail:
+        msg: >
+          /usr/bin/gitlab-ctl tidak ditemukan.
+          Hardening hanya berlaku untuk server yang sudah terinstall GitLab.
+      when: not ctl_stat.stat.exists
+
+    - name: "[PRE-0.5] Tampilkan info server"
+      debug:
+        msg:
+          - "Host      : {{ inventory_hostname }}"
+          - "OS        : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel    : {{ ansible_kernel }}"
+          - "CPU       : {{ ansible_processor_vcpus }} vCPU"
+          - "RAM       : {{ (ansible_memtotal_mb / 1024) | round(1) }} GB"
+          - "IP        : {{ ansible_default_ipv4.address | default('N/A') }}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 1 │ SSH HARDENING
+# KRITIS: sshd -t dijalankan SEBELUM reload. Jika syntax error → auto-restore.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 1 | SSH Hardening"
+  hosts: gitlab_server
+  gather_facts: true
+  any_errors_fatal: true
+
+  vars:
+    ssh_permit_root_login:       "{{ ssh_permit_root_login | default('no') }}"
+    ssh_password_authentication: "{{ ssh_password_authentication | default('no') }}"
+    ssh_max_auth_tries:          "{{ ssh_max_auth_tries | default(3) }}"
+    ssh_client_alive_interval:   "{{ ssh_client_alive_interval | default(300) }}"
+    ssh_client_alive_count_max:  "{{ ssh_client_alive_count_max | default(2) }}"
+    ssh_allowed_ciphers:         "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com"
+    ssh_allowed_macs:            "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
+    ssh_kex_algorithms:          "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256"
+
+  handlers:
+
+    - name: validate_and_reload_sshd
+      shell: |
+        if sshd -t 2>&1; then
+          systemctl reload sshd || systemctl restart sshd
+          echo "SSHD reloaded OK"
+        else
+          echo "SSHD config syntax ERROR — reload dibatalkan"
+          exit 1
+        fi
+      failed_when: false
+
+  tasks:
+
+    - name: "[SSH-1.1] Backup sshd_config asli"
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: "/etc/ssh/sshd_config.original.{{ ansible_date_time.date }}"
+        remote_src: true
+        force: false   # tidak overwrite jika backup sudah ada
+      register: ssh_backup
+
+    - name: "[SSH-1.2] Terapkan parameter SSH hardening"
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?PermitRootLogin',          line: 'PermitRootLogin {{ ssh_permit_root_login }}' }
+        - { regexp: '^#?PasswordAuthentication',   line: 'PasswordAuthentication {{ ssh_password_authentication }}' }
+        - { regexp: '^#?MaxAuthTries',             line: 'MaxAuthTries {{ ssh_max_auth_tries }}' }
+        - { regexp: '^#?ClientAliveInterval',      line: 'ClientAliveInterval {{ ssh_client_alive_interval }}' }
+        - { regexp: '^#?ClientAliveCountMax',      line: 'ClientAliveCountMax {{ ssh_client_alive_count_max }}' }
+        - { regexp: '^#?X11Forwarding',            line: 'X11Forwarding no' }
+        - { regexp: '^#?AllowAgentForwarding',     line: 'AllowAgentForwarding no' }
+        - { regexp: '^#?AllowTcpForwarding',       line: 'AllowTcpForwarding no' }
+        - { regexp: '^#?PrintLastLog',             line: 'PrintLastLog yes' }
+        - { regexp: '^#?LoginGraceTime',           line: 'LoginGraceTime 30' }
+        - { regexp: '^#?MaxStartups',              line: 'MaxStartups 10:30:60' }
+        - { regexp: '^#?Ciphers',                  line: 'Ciphers {{ ssh_allowed_ciphers }}' }
+        - { regexp: '^#?MACs',                     line: 'MACs {{ ssh_allowed_macs }}' }
+        - { regexp: '^#?KexAlgorithms',            line: 'KexAlgorithms {{ ssh_kex_algorithms }}' }
+        - { regexp: '^#?Protocol',                 line: 'Protocol 2' }
+        - { regexp: '^#?IgnoreRhosts',             line: 'IgnoreRhosts yes' }
+        - { regexp: '^#?HostbasedAuthentication',  line: 'HostbasedAuthentication no' }
+        - { regexp: '^#?PermitEmptyPasswords',     line: 'PermitEmptyPasswords no' }
+        - { regexp: '^#?UsePAM',                   line: 'UsePAM yes' }
+        - { regexp: '^#?StrictModes',              line: 'StrictModes yes' }
+        - { regexp: '^#?LogLevel',                 line: 'LogLevel VERBOSE' }
+      notify: validate_and_reload_sshd
+
+    - name: "[SSH-1.3] Paksa flush handler (validasi + reload sshd sekarang)"
+      meta: flush_handlers
+
+    - name: "[SSH-1.4] Verifikasi syntax sshd_config final"
+      shell: sshd -t 2>&1
+      register: sshd_syntax
+      changed_when: false
+
+    - name: "[SSH-1.5] Auto-restore jika syntax error"
+      copy:
+        src: "/etc/ssh/sshd_config.original.{{ ansible_date_time.date }}"
+        dest: /etc/ssh/sshd_config
+        remote_src: true
+      when: sshd_syntax.rc != 0
+
+    - name: "[SSH-1.6] Fail jika syntax error (restore sudah dilakukan)"
+      fail:
+        msg: >
+          sshd_config syntax error: {{ sshd_syntax.stdout }}.
+          File telah di-restore ke backup asli. Periksa konfigurasi secara manual.
+      when: sshd_syntax.rc != 0
+
+    - name: "[SSH-1.7] ✅ SSH Hardening selesai"
+      debug:
+        msg: "SSH hardening berhasil diterapkan. Backup ada di /etc/ssh/sshd_config.original.{{ ansible_date_time.date }}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 2 │ KERNEL / SYSCTL HARDENING
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 2 | Kernel Sysctl Hardening"
+  hosts: gitlab_server
+  gather_facts: false
+  any_errors_fatal: false
+
+  vars:
+    sysctl_harden_enabled: "{{ sysctl_harden_enabled | default(true) }}"
+
+  tasks:
+
+    - name: "[SYS-2.1] Terapkan sysctl hardening ke /etc/sysctl.d/99-gitlab-hardening.conf"
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: true
+        sysctl_file: /etc/sysctl.d/99-gitlab-hardening.conf
+      loop:
+        # ── Network protection ──────────────────────────────────────────
+        - { key: 'net.ipv4.tcp_syncookies',                    value: '1' }
+        - { key: 'net.ipv4.conf.all.rp_filter',                value: '1' }
+        - { key: 'net.ipv4.conf.default.rp_filter',            value: '1' }
+        - { key: 'net.ipv4.conf.all.accept_source_route',      value: '0' }
+        - { key: 'net.ipv4.conf.default.accept_source_route',  value: '0' }
+        - { key: 'net.ipv4.conf.all.accept_redirects',         value: '0' }
+        - { key: 'net.ipv4.conf.default.accept_redirects',     value: '0' }
+        - { key: 'net.ipv4.conf.all.secure_redirects',         value: '0' }
+        - { key: 'net.ipv4.conf.all.send_redirects',           value: '0' }
+        - { key: 'net.ipv4.conf.default.send_redirects',       value: '0' }
+        - { key: 'net.ipv4.conf.all.log_martians',             value: '1' }
+        - { key: 'net.ipv4.icmp_echo_ignore_broadcasts',       value: '1' }
+        - { key: 'net.ipv4.icmp_ignore_bogus_error_responses', value: '1' }
+        - { key: 'net.ipv6.conf.all.disable_ipv6',             value: '1' }
+        - { key: 'net.ipv6.conf.default.disable_ipv6',         value: '1' }
+        - { key: 'net.ipv6.conf.lo.disable_ipv6',              value: '1' }
+        # ── Memory / kernel protection ──────────────────────────────────
+        - { key: 'kernel.randomize_va_space',                   value: '2' }
+        - { key: 'fs.suid_dumpable',                           value: '0' }
+        - { key: 'kernel.core_uses_pid',                       value: '1' }
+        - { key: 'kernel.dmesg_restrict',                      value: '1' }
+        - { key: 'kernel.kptr_restrict',                       value: '2' }
+        - { key: 'kernel.perf_event_paranoid',                 value: '3' }
+        # ── Filesystem protection ───────────────────────────────────────
+        - { key: 'fs.protected_hardlinks',                     value: '1' }
+        - { key: 'fs.protected_symlinks',                      value: '1' }
+      failed_when: false   # VPS/container mungkin tidak support semua key
+      when: sysctl_harden_enabled | bool
+
+    - name: "[SYS-2.2] Reload sysctl dari file"
+      shell: sysctl --system 2>&1 | grep -v "^*" | tail -5
+      register: sysctl_reload
+      changed_when: false
+      failed_when: false
+
+    - name: "[SYS-2.3] ✅ Sysctl hardening selesai"
+      debug:
+        msg: "Sysctl hardening applied. File: /etc/sysctl.d/99-gitlab-hardening.conf"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 3 │ UFW FIREWALL
+# URUTAN KRITIS: tambah rules DULU, baru enable. Jangan terbalik.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 3 | UFW Firewall"
+  hosts: gitlab_server
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars:
+    firewall_enabled:            "{{ firewall_enabled | default(true) }}"
+    gitlab_http_port:            "{{ gitlab_http_port | default(80) }}"
+    gitlab_https_port:           "{{ gitlab_https_port | default(443) }}"
+    gitlab_ssh_port:             "{{ gitlab_ssh_port | default(22) }}"
+    gitlab_allowed_ssh_networks: "{{ gitlab_allowed_ssh_networks | default(['10.0.0.0/8','172.16.0.0/12','192.168.0.0/16']) }}"
+
+  tasks:
+
+    - name: "[UFW-3.1] Install UFW"
+      apt:
+        name: ufw
+        state: present
+        update_cache: false
+      when: firewall_enabled | bool
+
+    - name: "[UFW-3.2] Set policy: deny incoming, allow outgoing"
+      ufw:
+        direction: "{{ item.dir }}"
+        policy: "{{ item.pol }}"
+      loop:
+        - { dir: incoming, pol: deny }
+        - { dir: outgoing, pol: allow }
+      when: firewall_enabled | bool
+
+    - name: "[UFW-3.3] Allow HTTP (port {{ gitlab_http_port }})"
+      ufw:
+        rule: allow
+        port: "{{ gitlab_http_port | string }}"
+        proto: tcp
+        comment: "GitLab HTTP"
+      when: firewall_enabled | bool
+
+    - name: "[UFW-3.4] Allow HTTPS (port {{ gitlab_https_port }})"
+      ufw:
+        rule: allow
+        port: "{{ gitlab_https_port | string }}"
+        proto: tcp
+        comment: "GitLab HTTPS"
+      when: firewall_enabled | bool
+
+    - name: "[UFW-3.5] Allow SSH hanya dari network yang diizinkan"
+      ufw:
+        rule: allow
+        port: "{{ gitlab_ssh_port | string }}"
+        proto: tcp
+        src: "{{ item }}"
+        comment: "SSH dari {{ item }}"
+      loop: "{{ gitlab_allowed_ssh_networks }}"
+      when: firewall_enabled | bool
+
+    - name: "[UFW-3.6] Enable UFW (rules sudah lengkap)"
+      ufw:
+        state: enabled
+        logging: "on"
+      when: firewall_enabled | bool
+
+    - name: "[UFW-3.7] Tampilkan status UFW"
+      shell: ufw status numbered 2>&1
+      register: ufw_status
+      changed_when: false
+      when: firewall_enabled | bool
+
+    - name: "[UFW-3.8] ✅ Status UFW saat ini"
+      debug:
+        msg: "{{ ufw_status.stdout_lines }}"
+      when: firewall_enabled | bool
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 4 │ FAIL2BAN
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 4 | Fail2ban"
+  hosts: gitlab_server
+  gather_facts: false
+  any_errors_fatal: false
+
+  vars:
+    fail2ban_enabled:  "{{ fail2ban_enabled | default(true) }}"
+    fail2ban_maxretry: "{{ fail2ban_maxretry | default(5) }}"
+    fail2ban_bantime:  "{{ fail2ban_bantime | default(3600) }}"
+    fail2ban_findtime: "{{ fail2ban_findtime | default(600) }}"
+    gitlab_ssh_port:   "{{ gitlab_ssh_port | default(22) }}"
+
+  handlers:
+
+    - name: restart_fail2ban
+      systemd:
+        name: fail2ban
+        state: restarted
+      failed_when: false
+
+  tasks:
+
+    - name: "[F2B-4.1] Install fail2ban"
+      apt:
+        name: fail2ban
+        state: present
+      when: fail2ban_enabled | bool
+
+    - name: "[F2B-4.2] Konfigurasi jail GitLab"
+      copy:
+        dest: /etc/fail2ban/jail.d/gitlab.conf
+        mode: '0644'
+        content: |
+          [DEFAULT]
+          bantime  = {{ fail2ban_bantime }}
+          findtime = {{ fail2ban_findtime }}
+          maxretry = {{ fail2ban_maxretry }}
+          backend  = auto
+          usedns   = warn
+
+          [sshd]
+          enabled  = true
+          port     = {{ gitlab_ssh_port }}
+          logpath  = /var/log/auth.log
+          maxretry = {{ fail2ban_maxretry }}
+
+          [gitlab]
+          enabled  = true
+          port     = http,https
+          filter   = gitlab
+          logpath  = /var/log/gitlab/gitlab-rails/production.log
+          maxretry = {{ fail2ban_maxretry }}
+      notify: restart_fail2ban
+      when: fail2ban_enabled | bool
+
+    - name: "[F2B-4.3] Filter regex untuk GitLab login failure"
+      copy:
+        dest: /etc/fail2ban/filter.d/gitlab.conf
+        mode: '0644'
+        content: |
+          [Definition]
+          failregex = Failed Login: username=.+ ip=<HOST>
+                      Rack attack blocked: method=.+ path=.+ rule=.+ ip=<HOST>
+          ignoreregex =
+      notify: restart_fail2ban
+      when: fail2ban_enabled | bool
+
+    - name: "[F2B-4.4] Enable & start fail2ban"
+      systemd:
+        name: fail2ban
+        enabled: true
+        state: started
+      when: fail2ban_enabled | bool
+
+    - name: "[F2B-4.5] Flush handler restart fail2ban"
+      meta: flush_handlers
+
+    - name: "[F2B-4.6] Verifikasi status fail2ban"
+      shell: fail2ban-client status 2>&1
+      register: f2b_status
+      changed_when: false
+      failed_when: false
+
+    - name: "[F2B-4.7] ✅ Status Fail2ban"
+      debug:
+        msg: "{{ f2b_status.stdout_lines }}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 5 │ FILE PERMISSIONS & VERIFIKASI AKHIR
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 5 | File Permissions & Verifikasi Akhir"
+  hosts: gitlab_server
+  gather_facts: false
+  any_errors_fatal: false
+
+  tasks:
+
+    - name: "[FIN-5.1] Secure file permissions sistem"
+      file:
+        path: "{{ item.p }}"
+        mode: "{{ item.m }}"
+      loop:
+        - { p: '/etc/passwd',          m: '0644' }
+        - { p: '/etc/group',           m: '0644' }
+        - { p: '/etc/shadow',          m: '0640' }
+        - { p: '/etc/gshadow',         m: '0640' }
+        - { p: '/etc/ssh/sshd_config', m: '0600' }
+      failed_when: false
+
+    - name: "[FIN-5.2] Secure GitLab config directory"
+      file:
+        path: /etc/gitlab
+        mode: '0750'
+        state: directory
+      failed_when: false
+
+    - name: "[FIN-5.3] Verifikasi UFW aktif"
+      shell: ufw status | grep "Status:" | awk '{print $2}'
+      register: ufw_active
+      changed_when: false
+      failed_when: false
+
+    - name: "[FIN-5.4] Verifikasi fail2ban aktif"
+      shell: systemctl is-active fail2ban 2>&1
+      register: f2b_active
+      changed_when: false
+      failed_when: false
+
+    - name: "[FIN-5.5] Verifikasi sshd config valid"
+      shell: sshd -t 2>&1 && echo "OK" || echo "ERROR"
+      register: sshd_final
+      changed_when: false
+      failed_when: false
+
+    - name: "[FIN-5.6] Verifikasi sysctl hardening file ada"
+      stat:
+        path: /etc/sysctl.d/99-gitlab-hardening.conf
+      register: sysctl_file_stat
+
+    - name: "[FIN-5.7] Laporan akhir hardening"
+      debug:
+        msg:
+          - "══════════════════════════════════════════════"
+          - "  LAPORAN SECURITY HARDENING GITLAB"
+          - "══════════════════════════════════════════════"
+          - "  Host         : {{ inventory_hostname }}"
+          - "  Timestamp    : {{ ansible_date_time.iso8601 }}"
+          - "  SSH Hardening: ✅ Applied (backup di /etc/ssh/sshd_config.original.*)"
+          - "  SSH Config   : {{ '✅ Syntax OK' if 'OK' in sshd_final.stdout else '❌ ERROR — cek manual!' }}"
+          - "  Sysctl       : {{ '✅ Applied' if sysctl_file_stat.stat.exists else '⚠️  File tidak ditemukan' }}"
+          - "  UFW Firewall : {{ '✅ Active' if ufw_active.stdout | trim == 'active' else '⚠️  ' + ufw_active.stdout | trim }}"
+          - "  Fail2ban     : {{ '✅ Active' if f2b_active.stdout | trim == 'active' else '⚠️  ' + f2b_active.stdout | trim }}"
+          - "══════════════════════════════════════════════"
+          - "  ℹ️  Playbook ini cukup dijalankan SEKALI."
+          - "  ℹ️  Untuk patching rutin, gunakan gitlab_routine_patch.yml"
+          - "══════════════════════════════════════════════"
+
+    - name: "[FIN-5.8] Simpan laporan ke Semaphore controller"
+      copy:
+        content: |
+          ══════════════════════════════════════════
+          LAPORAN SECURITY HARDENING GITLAB
+          ══════════════════════════════════════════
+          Host         : {{ inventory_hostname }}
+          Timestamp    : {{ ansible_date_time.iso8601 }}
+          SSH Hardening: Applied
+          SSH Syntax   : {{ 'OK' if 'OK' in sshd_final.stdout else 'ERROR' }}
+          Sysctl File  : {{ 'Exists' if sysctl_file_stat.stat.exists else 'Missing' }}
+          UFW          : {{ ufw_active.stdout | trim }}
+          Fail2ban     : {{ f2b_active.stdout | trim }}
+          ══════════════════════════════════════════
+        dest: "/tmp/gitlab_hardening_report_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
+      delegate_to: localhost
+      become: false
+      failed_when: false
