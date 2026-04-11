@@ -37,7 +37,7 @@
   any_errors_fatal: true
 
   vars:
-    gitlab_package_name:        "{{ gitlab_package_name | default('gitlab-ee') }}"
+    gitlab_package_name:        "{{ gitlab_package_name | default('gitlab-ce') }}"
     gitlab_backup_path:         "/var/opt/gitlab/backups"
     apt_lock_timeout:           300
     apt_retries:                "{{ apt_retries | default(3) }}"
