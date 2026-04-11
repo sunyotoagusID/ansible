@@ -1,0 +1,794 @@
+---
+# =============================================================================
+# FILE    : gitlab_routine_patch.yml
+# TUJUAN  : Dijalankan RUTIN (mingguan/bulanan) — OS patch + GitLab patch
+# SEMAPHORE TEMPLATE:
+#   Playbook  : gitlab_routine_patch.yml
+#   Arguments : (kosong)
+#   Schedule  : Cron — setiap Sabtu 02:00 WIB → "0 19 * * 5" (UTC)
+# =============================================================================
+# URUTAN EKSEKUSI:
+#   PHASE 0 → Pre-flight (koneksi, disk, apt lock, versi GitLab)
+#   PHASE 1 → Backup Cleanup (hapus backup > 7 hari)
+#   PHASE 2 → OS Security Patches (non-kernel only)
+#   PHASE 3 → GitLab Pre-Patch (maintenance mode, stop jobs, backup)
+#   PHASE 4 → GitLab Patch (patch-only, validasi no major jump)
+#   PHASE 5 → Verify + Auto-Rollback + Report
+# =============================================================================
+# VARIABEL SEMAPHORE ENVIRONMENT (JSON):
+# {
+#   "ansible_ssh_user"          : "ubuntu",
+#   "gitlab_package_name"       : "gitlab-ee",
+#   "gitlab_target_version"     : "",
+#   "gitlab_backup_before_patch": true,
+#   "gitlab_rollback_on_failure": true,
+#   "backup_retention_days"     : 7
+# }
+# =============================================================================
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 0 │ PRE-FLIGHT
+# any_errors_fatal: true — gagal di sini = seluruh run berhenti
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 0 | Pre-flight Checks"
+  hosts: gitlab_server
+  gather_facts: true
+  any_errors_fatal: true
+
+  vars:
+    gitlab_package_name:        "{{ gitlab_package_name | default('gitlab-ee') }}"
+    gitlab_backup_path:         "/var/opt/gitlab/backups"
+    apt_lock_timeout:           300
+    apt_retries:                "{{ apt_retries | default(3) }}"
+    apt_retry_delay:            "{{ apt_retry_delay | default(10) }}"
+    backup_retention_days:      "{{ backup_retention_days | default(7) }}"
+
+  tasks:
+
+    - name: "[PRE-0.1] Verifikasi koneksi SSH"
+      ping:
+
+    - name: "[PRE-0.2] Validasi OS"
+      assert:
+        that:
+          - ansible_os_family == "Debian"
+          - ansible_distribution in ["Ubuntu", "Debian"]
+          - ansible_distribution_major_version | int >= 20
+        fail_msg: "OS tidak didukung: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+        success_msg: "✅ OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: "[PRE-0.3] Cek gitlab-ctl tersedia"
+      stat:
+        path: /usr/bin/gitlab-ctl
+      register: ctl_stat
+
+    - name: "[PRE-0.4] Fail jika GitLab tidak terinstall"
+      fail:
+        msg: "/usr/bin/gitlab-ctl tidak ditemukan. Install GitLab terlebih dahulu."
+      when: not ctl_stat.stat.exists
+
+    - name: "[PRE-0.5] Ambil versi GitLab saat ini"
+      shell: >
+        dpkg -l {{ gitlab_package_name }} 2>/dev/null |
+        grep "^ii" | awk '{print $3}' | head -1
+      register: gl_ver_now
+      changed_when: false
+      failed_when: gl_ver_now.stdout | trim == ""
+
+    - name: "[PRE-0.6] Set fact versi pre-patch"
+      set_fact:
+        gitlab_pre_patch_version: "{{ gl_ver_now.stdout | trim }}"
+
+    - name: "[PRE-0.7] Cek disk space tersisa di backup path (min 5 GB)"
+      shell: |
+        AVAIL=$(df -BG {{ gitlab_backup_path }} 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+        [ -z "$AVAIL" ] && AVAIL=$(df -BG /var/opt/gitlab | tail -1 | awk '{print $4}' | tr -d 'G')
+        echo "$AVAIL"
+      register: disk_free_gb
+      changed_when: false
+
+    - name: "[PRE-0.8] Fail jika disk < 5 GB"
+      fail:
+        msg: >
+          Disk tidak cukup: {{ disk_free_gb.stdout | trim }} GB tersisa.
+          Minimal 5 GB diperlukan. Hapus file lama atau perluas storage.
+      when: disk_free_gb.stdout | trim | int < 5
+
+    - name: "[PRE-0.9] Cek & tunggu apt lock hilang"
+      shell: |
+        TIMEOUT={{ apt_lock_timeout }}
+        ELAPSED=0
+        while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; do
+          if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+            echo "APT_LOCK_TIMEOUT setelah ${TIMEOUT}s"
+            exit 1
+          fi
+          echo "Menunggu apt lock... ${ELAPSED}s"
+          sleep 5
+          ELAPSED=$((ELAPSED + 5))
+        done
+        echo "APT_LOCK_FREE"
+      register: apt_lock_st
+      changed_when: false
+      failed_when: "'APT_LOCK_TIMEOUT' in apt_lock_st.stdout"
+
+    - name: "[PRE-0.10] Tampilkan ringkasan pre-flight"
+      debug:
+        msg:
+          - "Host             : {{ inventory_hostname }}"
+          - "GitLab versi     : {{ gitlab_pre_patch_version }}"
+          - "Disk bebas       : {{ disk_free_gb.stdout | trim }} GB"
+          - "Backup retention : {{ backup_retention_days }} hari"
+          - "APT lock         : {{ apt_lock_st.stdout | trim }}"
+
+    - name: "[PRE-0.11] Simpan snapshot pre-run ke controller"
+      copy:
+        content: |
+          host={{ inventory_hostname }}
+          timestamp={{ ansible_date_time.iso8601 }}
+          gitlab_version_pre={{ gitlab_pre_patch_version }}
+          os={{ ansible_distribution }} {{ ansible_distribution_version }}
+          disk_free_gb={{ disk_free_gb.stdout | trim }}
+          backup_retention_days={{ backup_retention_days }}
+        dest: "/tmp/gitlab_routine_pre_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
+      delegate_to: localhost
+      become: false
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 1 │ BACKUP CLEANUP — PERTAHANKAN 7 HARI TERAKHIR
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 1 | Backup Cleanup (Retensi {{ backup_retention_days | default(7) }} Hari)"
+  hosts: gitlab_server
+  gather_facts: true
+  any_errors_fatal: false
+
+  vars:
+    gitlab_backup_path:    "/var/opt/gitlab/backups"
+    backup_retention_days: "{{ backup_retention_days | default(7) }}"
+
+  tasks:
+
+    - name: "[CLN-1.1] Daftar semua file backup sebelum cleanup"
+      shell: |
+        ls -lh {{ gitlab_backup_path }}/*.tar 2>/dev/null || echo "KOSONG"
+      register: backup_before_cleanup
+      changed_when: false
+
+    - name: "[CLN-1.2] Tampilkan backup yang ada sekarang"
+      debug:
+        msg:
+          - "=== Backup sebelum cleanup ==="
+          - "{{ backup_before_cleanup.stdout_lines }}"
+
+    - name: "[CLN-1.3] Identifikasi backup yang akan dihapus (> {{ backup_retention_days }} hari)"
+      shell: |
+        find {{ gitlab_backup_path }} \
+          -maxdepth 1 \
+          -name "*.tar" \
+          -type f \
+          -mtime +{{ backup_retention_days }} \
+          -printf "%TY-%Tm-%Td %TH:%TM  %s bytes  %f\n" \
+          2>/dev/null | sort || echo "TIDAK_ADA"
+      register: backup_to_delete
+      changed_when: false
+
+    - name: "[CLN-1.4] Tampilkan backup yang akan dihapus"
+      debug:
+        msg:
+          - "=== Backup yang akan dihapus (> {{ backup_retention_days }} hari) ==="
+          - "{{ backup_to_delete.stdout_lines }}"
+
+    - name: "[CLN-1.5] Hapus backup lebih dari {{ backup_retention_days }} hari"
+      shell: |
+        DELETED=0
+        ERRORS=0
+        while IFS= read -r -d '' f; do
+          if rm -f "$f" 2>/dev/null; then
+            echo "DELETED: $(basename $f)"
+            DELETED=$((DELETED+1))
+          else
+            echo "ERROR deleting: $(basename $f)"
+            ERRORS=$((ERRORS+1))
+          fi
+        done < <(find {{ gitlab_backup_path }} \
+          -maxdepth 1 \
+          -name "*.tar" \
+          -type f \
+          -mtime +{{ backup_retention_days }} \
+          -print0 2>/dev/null)
+        echo "Total dihapus: $DELETED file, Error: $ERRORS"
+      register: cleanup_result
+      changed_when: "'DELETED:' in cleanup_result.stdout"
+      failed_when: false
+
+    - name: "[CLN-1.6] Tampilkan hasil cleanup"
+      debug:
+        msg: "{{ cleanup_result.stdout_lines }}"
+
+    - name: "[CLN-1.7] Verifikasi backup tersisa setelah cleanup"
+      shell: |
+        COUNT=$(ls {{ gitlab_backup_path }}/*.tar 2>/dev/null | wc -l)
+        TOTAL_SIZE=$(du -sh {{ gitlab_backup_path }}/*.tar 2>/dev/null | \
+          awk '{sum+=$1} END{print sum+0 "M"}' || echo "0M")
+        echo "File tersisa: $COUNT"
+        echo "Total ukuran: $TOTAL_SIZE"
+        ls -lh {{ gitlab_backup_path }}/*.tar 2>/dev/null || echo "(tidak ada backup tersisa)"
+      register: backup_after_cleanup
+      changed_when: false
+
+    - name: "[CLN-1.8] ✅ Status backup setelah cleanup"
+      debug:
+        msg: "{{ backup_after_cleanup.stdout_lines }}"
+
+    - name: "[CLN-1.9] Cek disk space setelah cleanup"
+      shell: df -h {{ gitlab_backup_path }} 2>/dev/null | tail -1
+      register: disk_after_cleanup
+      changed_when: false
+
+    - name: "[CLN-1.10] Tampilkan disk setelah cleanup"
+      debug:
+        msg: "Disk setelah cleanup: {{ disk_after_cleanup.stdout }}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 2 │ OS SECURITY PATCHES (non-kernel only)
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 2 | OS Security Patches (non-kernel)"
+  hosts: gitlab_server
+  gather_facts: false
+  any_errors_fatal: false
+
+  vars:
+    os_exclude_packages:
+      - "kernel"
+      - "linux-image"
+      - "linux-headers"
+      - "linux-modules"
+      - "linux-generic"
+    apt_retries:    "{{ apt_retries | default(3) }}"
+    apt_retry_delay: "{{ apt_retry_delay | default(10) }}"
+
+  tasks:
+
+    - name: "[OS-2.1] Update apt cache"
+      apt:
+        update_cache: true
+        cache_valid_time: 0
+      register: apt_upd
+      retries: "{{ apt_retries }}"
+      delay: "{{ apt_retry_delay }}"
+      until: apt_upd is succeeded
+
+    - name: "[OS-2.2] Identifikasi security updates tersedia (non-kernel)"
+      shell: |
+        apt-get -s upgrade 2>/dev/null \
+          | grep "^Inst" \
+          | grep -i security \
+          | grep -v -E "({{ os_exclude_packages | join('|') }})" \
+          | awk '{print $2}' \
+          || true
+      register: sec_pkgs
+      changed_when: false
+
+    - name: "[OS-2.3] Tampilkan security packages yang akan di-patch"
+      debug:
+        msg: >
+          {{ sec_pkgs.stdout_lines | length }} paket security tersedia:
+          {{ sec_pkgs.stdout_lines | join(', ') if sec_pkgs.stdout_lines else 'tidak ada — skip' }}
+
+    - name: "[OS-2.4] Apply OS security patches (non-kernel)"
+      shell: |
+        PKGS="{{ sec_pkgs.stdout_lines | join(' ') }}"
+        if [ -z "$(echo $PKGS | tr -d ' ')" ]; then
+          echo "SKIP: tidak ada OS security patch tersedia"
+          exit 0
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get install \
+          --only-upgrade \
+          -o Dpkg::Options::="--force-confdef" \
+          -o Dpkg::Options::="--force-confold" \
+          -y $PKGS 2>&1
+      register: os_patch_result
+      when: sec_pkgs.stdout_lines | length > 0
+      changed_when: "'0 upgraded' not in (os_patch_result.stdout | default(''))"
+      failed_when: >
+        os_patch_result.rc is defined and
+        os_patch_result.rc != 0 and
+        'SKIP' not in (os_patch_result.stdout | default(''))
+
+    - name: "[OS-2.5] Cek apakah reboot diperlukan"
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_req
+
+    - name: "[OS-2.6] Tampilkan status reboot"
+      debug:
+        msg: >
+          {{ '⚠️  /var/run/reboot-required ada — reboot disarankan setelah maintenance window'
+             if reboot_req.stat.exists else
+             '✅ Tidak ada reboot required' }}
+
+    - name: "[OS-2.7] Catat packages yang di-patch"
+      shell: |
+        grep "$(date +%Y-%m-%d)" /var/log/dpkg.log 2>/dev/null | \
+          grep " install \| upgrade " | tail -20 || echo "Log tidak tersedia"
+      register: dpkg_log_today
+      changed_when: false
+      failed_when: false
+
+    - name: "[OS-2.8] Tampilkan log dpkg hari ini"
+      debug:
+        msg: "{{ dpkg_log_today.stdout_lines }}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 3 │ GITLAB PRE-PATCH PREPARATION
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 3 | GitLab Pre-Patch Preparation"
+  hosts: gitlab_server
+  gather_facts: true
+  any_errors_fatal: true
+
+  vars:
+    gitlab_package_name:        "{{ gitlab_package_name | default('gitlab-ee') }}"
+    gitlab_backup_before_patch: "{{ gitlab_backup_before_patch | default(true) }}"
+    gitlab_backup_path:         "/var/opt/gitlab/backups"
+    gitlab_backup_timeout:      3600
+    gitlab_backup_skip:         "{{ gitlab_backup_skip | default('registry,artifacts') }}"
+    gitlab_maintenance_enabled: true
+    gitlab_maintenance_message: "GitLab sedang proses patching rutin. Estimasi 30 menit."
+    backup_retention_days:      "{{ backup_retention_days | default(7) }}"
+
+  tasks:
+
+    - name: "[PREP-3.1] Aktifkan maintenance mode"
+      shell: |
+        gitlab-rails runner "
+          Gitlab::CurrentSettings.update!(
+            maintenance_mode: true,
+            maintenance_mode_message: '{{ gitlab_maintenance_message }}'
+          )
+        " 2>&1 || echo "MAINTENANCE_MODE_SKIP: rails runner gagal, lanjutkan"
+      register: maint_result
+      changed_when: "'MAINTENANCE_MODE_SKIP' not in maint_result.stdout"
+      failed_when: false
+
+    - name: "[PREP-3.2] Tampilkan hasil maintenance mode"
+      debug:
+        msg: "{{ maint_result.stdout_lines | default(['maintenance mode: skipped']) }}"
+
+    - name: "[PREP-3.3] Stop Sidekiq (background jobs)"
+      shell: gitlab-ctl stop sidekiq 2>&1 || true
+      failed_when: false
+
+    - name: "[PREP-3.4] Stop Puma (web workers)"
+      shell: gitlab-ctl stop puma 2>&1 || true
+      failed_when: false
+
+    - name: "[PREP-3.5] Tunggu 20 detik agar active requests selesai"
+      pause:
+        seconds: 20
+        prompt: "Menunggu active requests selesai sebelum backup..."
+
+    - name: "[PREP-3.6] Buat backup GitLab pre-patch"
+      shell: |
+        CRON=1 gitlab-backup create \
+          BACKUP=pre_patch_{{ ansible_date_time.date | replace('-','') }} \
+          SKIP={{ gitlab_backup_skip }} 2>&1
+      register: backup_result
+      async: "{{ gitlab_backup_timeout }}"
+      poll: 30
+      when: gitlab_backup_before_patch | bool
+      failed_when:
+        - backup_result.rc is defined
+        - backup_result.rc != 0
+
+    - name: "[PREP-3.7] Verifikasi file backup terbuat"
+      shell: >
+        ls -lh {{ gitlab_backup_path }}/*pre_patch_{{ ansible_date_time.date | replace('-','') }}*.tar
+        2>/dev/null | head -3
+      register: backup_verify
+      when: gitlab_backup_before_patch | bool
+      failed_when: backup_verify.rc != 0
+
+    - name: "[PREP-3.8] Tampilkan info backup"
+      debug:
+        msg: "{{ backup_verify.stdout_lines | default(['Backup skipped']) }}"
+
+    - name: "[PREP-3.9] Catat versi untuk rollback"
+      shell: >
+        dpkg -l {{ gitlab_package_name }} 2>/dev/null |
+        grep "^ii" | awk '{print $3}' | head -1
+      register: ver_for_rollback
+      changed_when: false
+
+    - name: "[PREP-3.10] Set fact rollback version"
+      set_fact:
+        gitlab_rollback_version: "{{ ver_for_rollback.stdout | trim }}"
+
+    - name: "[PREP-3.11] Konfirmasi versi pre-patch"
+      debug:
+        msg: "Versi pre-patch (rollback target jika gagal): {{ gitlab_rollback_version }}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 4 │ GITLAB PATCH — PATCH ONLY, NO MAJOR VERSION JUMP
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 4 | GitLab Patch (Patch-Only)"
+  hosts: gitlab_server
+  gather_facts: false
+  any_errors_fatal: false
+
+  vars:
+    gitlab_package_name:         "{{ gitlab_package_name | default('gitlab-ee') }}"
+    gitlab_target_version:       "{{ gitlab_target_version | default('') }}"
+    gitlab_allow_major_upgrade:  false      # JANGAN UBAH — patch-only policy
+    gitlab_allowed_version_jump: 1          # maks selisih 1 minor version
+    apt_retries:                 "{{ apt_retries | default(3) }}"
+    apt_retry_delay:             "{{ apt_retry_delay | default(10) }}"
+
+  tasks:
+
+    - name: "[PATCH-4.1] Tampilkan versi tersedia di repository"
+      shell: apt-cache madison {{ gitlab_package_name }} 2>/dev/null | head -15
+      register: repo_versions
+      changed_when: false
+      failed_when: false
+
+    - name: "[PATCH-4.2] Daftar versi tersedia"
+      debug:
+        msg: "{{ repo_versions.stdout_lines }}"
+
+    - name: "[PATCH-4.3] Tentukan versi target & validasi patch-only"
+      shell: |
+        set -e
+        CURRENT="{{ gitlab_rollback_version | default('') }}"
+        if [ -z "$CURRENT" ]; then
+          CURRENT=$(dpkg -l {{ gitlab_package_name }} | grep "^ii" | awk '{print $3}' | head -1)
+        fi
+
+        CUR_MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+        CUR_MINOR=$(echo "$CURRENT" | cut -d. -f2)
+
+        # ── Mode: versi spesifik ditentukan ──────────────────────────────
+        {% if gitlab_target_version != "" %}
+          TARGET="{{ gitlab_target_version }}"
+          TGT_MAJOR=$(echo "$TARGET" | cut -d. -f1)
+          TGT_MINOR=$(echo "$TARGET" | cut -d. -f2)
+
+          if [ "$TGT_MAJOR" != "$CUR_MAJOR" ]; then
+            echo "ERROR_MAJOR_JUMP: ${CURRENT} → ${TARGET}"
+            echo "Major version jump tidak diizinkan (patch-only policy)."
+            echo "Gunakan upgrade path resmi: https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/"
+            exit 1
+          fi
+
+          DIFF=$((TGT_MINOR - CUR_MINOR))
+          if [ "$DIFF" -gt "{{ gitlab_allowed_version_jump }}" ]; then
+            echo "ERROR_MINOR_JUMP: selisih minor ${DIFF} > {{ gitlab_allowed_version_jump }}"
+            echo "Naikkan gitlab_allowed_version_jump jika memang perlu skip minor."
+            exit 1
+          fi
+
+          echo "TARGET=$TARGET"
+
+        # ── Mode: auto — ambil latest patch dari major.minor yang sama ──
+        {% else %}
+          LATEST=$(apt-cache madison {{ gitlab_package_name }} 2>/dev/null \
+            | awk '{print $3}' \
+            | grep "^${CUR_MAJOR}\.${CUR_MINOR}\." \
+            | sort -V \
+            | tail -1)
+
+          if [ -z "$LATEST" ]; then
+            echo "ALREADY_LATEST: Tidak ada versi ${CUR_MAJOR}.${CUR_MINOR}.x lebih baru di repo"
+            exit 0
+          fi
+
+          if [ "$LATEST" = "$CURRENT" ]; then
+            echo "ALREADY_LATEST: $CURRENT adalah versi terbaru untuk ${CUR_MAJOR}.${CUR_MINOR}.x"
+            exit 0
+          fi
+
+          echo "TARGET=$LATEST"
+        {% endif %}
+      register: ver_decision
+      changed_when: false
+
+    - name: "[PATCH-4.4] Parse keputusan versi"
+      set_fact:
+        patch_target: >-
+          {{ ver_decision.stdout_lines |
+             select('match', '^TARGET=') | list | first | default('') |
+             regex_replace('^TARGET=', '') | trim }}
+        patch_skip:  "{{ 'ALREADY_LATEST' in ver_decision.stdout }}"
+        patch_error: "{{ 'ERROR_' in ver_decision.stdout }}"
+
+    - name: "[PATCH-4.5] Fail jika ada error validasi"
+      fail:
+        msg: |
+          Validasi versi gagal!
+          {{ ver_decision.stdout | trim }}
+      when: patch_error
+
+    - name: "[PATCH-4.6] Tampilkan keputusan patching"
+      debug:
+        msg: >-
+          {{ '✅ SKIP — ' + ver_decision.stdout | trim
+             if patch_skip else
+             '🔄 PATCH: ' + (gitlab_rollback_version | default('?')) + ' → ' + patch_target }}
+
+    - name: "[PATCH-4.7] Stop GitLab sebelum upgrade"
+      shell: gitlab-ctl stop 2>&1 || true
+      when:
+        - not patch_skip
+        - patch_target != ''
+
+    - name: "[PATCH-4.8] Upgrade package GitLab"
+      apt:
+        name: >-
+          {{ gitlab_package_name + '=' + patch_target
+             if patch_target != '' else gitlab_package_name }}
+        state: present
+        only_upgrade: true
+        dpkg_options: "force-confdef,force-confold"
+        update_cache: false
+      register: pkg_upgrade
+      when:
+        - not patch_skip
+        - patch_target != ''
+      retries: "{{ apt_retries }}"
+      delay: "{{ apt_retry_delay }}"
+      until: pkg_upgrade is succeeded
+
+    - name: "[PATCH-4.9] gitlab-ctl reconfigure"
+      shell: gitlab-ctl reconfigure 2>&1
+      register: reconf_result
+      async: 600
+      poll: 15
+      when:
+        - not patch_skip
+        - patch_target != ''
+      failed_when: reconf_result.rc != 0
+
+    - name: "[PATCH-4.10] Jalankan database migrations"
+      shell: gitlab-rake db:migrate 2>&1
+      register: db_migrate
+      async: 300
+      poll: 15
+      when:
+        - not patch_skip
+        - patch_target != ''
+      failed_when: db_migrate.rc != 0
+
+    - name: "[PATCH-4.11] Start GitLab services"
+      shell: gitlab-ctl start 2>&1
+      register: gl_start
+      when:
+        - not patch_skip
+        - patch_target != ''
+      failed_when: false
+
+    - name: "[PATCH-4.12] Ringkasan hasil upgrade"
+      debug:
+        msg:
+          - "Package upgrade : {{ 'SUCCESS' if pkg_upgrade is succeeded else 'SKIPPED/NA' }}"
+          - "Reconfigure     : {{ 'SUCCESS' if reconf_result is succeeded else 'SKIPPED/NA' }}"
+          - "DB Migrate      : {{ 'SUCCESS' if db_migrate is succeeded else 'SKIPPED/NA' }}"
+      when: not patch_skip
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 5 │ VERIFICATION + AUTO-ROLLBACK + FINAL REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+- name: "PHASE 5 | Verify + Auto-Rollback + Report"
+  hosts: gitlab_server
+  gather_facts: true
+  any_errors_fatal: false
+
+  vars:
+    gitlab_package_name:        "{{ gitlab_package_name | default('gitlab-ee') }}"
+    gitlab_healthcheck_url:     "{{ gitlab_healthcheck_url | default('http://localhost/-/health') }}"
+    gitlab_readiness_url:       "{{ gitlab_readiness_url | default('http://localhost/-/readiness') }}"
+    gitlab_healthcheck_retries: "{{ gitlab_healthcheck_retries | default(20) }}"
+    gitlab_healthcheck_delay:   "{{ gitlab_healthcheck_delay | default(15) }}"
+    gitlab_rollback_on_failure: "{{ gitlab_rollback_on_failure | default(true) }}"
+    gitlab_backup_path:         "/var/opt/gitlab/backups"
+    backup_retention_days:      "{{ backup_retention_days | default(7) }}"
+
+  tasks:
+
+    - name: "[VFY-5.1] Tunggu 60 detik — GitLab startup"
+      pause:
+        seconds: 60
+        prompt: "Menunggu GitLab services fully up setelah patch..."
+
+    - name: "[VFY-5.2] Health check: /-/health"
+      uri:
+        url: "{{ gitlab_healthcheck_url }}"
+        method: GET
+        status_code: [200]
+        timeout: 30
+        validate_certs: false
+      register: health
+      retries: "{{ gitlab_healthcheck_retries }}"
+      delay: "{{ gitlab_healthcheck_delay }}"
+      until: health.status == 200
+      failed_when: false
+
+    - name: "[VFY-5.3] Readiness check: /-/readiness"
+      uri:
+        url: "{{ gitlab_readiness_url }}"
+        method: GET
+        status_code: [200]
+        timeout: 30
+        validate_certs: false
+      register: readiness
+      retries: "{{ gitlab_healthcheck_retries }}"
+      delay: "{{ gitlab_healthcheck_delay }}"
+      until: readiness.status == 200
+      failed_when: false
+
+    - name: "[VFY-5.4] Ambil versi GitLab setelah patch"
+      shell: >
+        dpkg -l {{ gitlab_package_name }} 2>/dev/null |
+        grep "^ii" | awk '{print $3}' | head -1
+      register: ver_after
+      changed_when: false
+
+    - name: "[VFY-5.5] Evaluasi hasil"
+      set_fact:
+        patch_ok:           "{{ (health.status | default(0) == 200) and (readiness.status | default(0) == 200) }}"
+        gitlab_post_version: "{{ ver_after.stdout | trim }}"
+
+    - name: "[VFY-5.6] Tampilkan hasil verifikasi"
+      debug:
+        msg:
+          - "══════════════════════════════════════════════"
+          - "  HASIL ROUTINE PATCH GITLAB"
+          - "══════════════════════════════════════════════"
+          - "  Host         : {{ inventory_hostname }}"
+          - "  Versi lama   : {{ gitlab_rollback_version | default('N/A') }}"
+          - "  Versi baru   : {{ gitlab_post_version }}"
+          - "  Health       : {{ '✅ PASS' if health.status | default(0) == 200 else '❌ FAIL' }}"
+          - "  Readiness    : {{ '✅ PASS' if readiness.status | default(0) == 200 else '❌ FAIL' }}"
+          - "  Status       : {{ '✅ SUKSES' if patch_ok else '❌ GAGAL — memulai rollback...' }}"
+          - "══════════════════════════════════════════════"
+
+    # ── AUTO-ROLLBACK BLOCK ───────────────────────────────────────────────────
+    - name: "[RB] Auto-rollback (aktif hanya jika patch gagal)"
+      when:
+        - not patch_ok
+        - gitlab_rollback_on_failure | bool
+      block:
+
+        - name: "[RB-5.7] Stop GitLab untuk rollback"
+          shell: gitlab-ctl stop 2>&1 || true
+          failed_when: false
+
+        - name: "[RB-5.8] Downgrade package ke versi pre-patch"
+          apt:
+            name: "{{ gitlab_package_name }}={{ gitlab_rollback_version }}"
+            state: present
+            allow_downgrade: true
+            dpkg_options: "force-confdef,force-confold"
+          register: rb_pkg
+          failed_when: false
+
+        - name: "[RB-5.9] Reconfigure setelah downgrade"
+          shell: gitlab-ctl reconfigure 2>&1
+          register: rb_reconf
+          async: 600
+          poll: 15
+          failed_when: false
+
+        - name: "[RB-5.10] Cari backup pre-patch terbaru"
+          shell: |
+            FOUND=$(ls -t {{ gitlab_backup_path }}/*pre_patch*.tar 2>/dev/null | head -1)
+            if [ -z "$FOUND" ]; then
+              FOUND=$(ls -t {{ gitlab_backup_path }}/*.tar 2>/dev/null | head -1)
+            fi
+            if [ -z "$FOUND" ]; then
+              echo "ERROR: tidak ada backup ditemukan"
+              exit 1
+            fi
+            echo "$FOUND"
+          register: rb_backup_file
+          failed_when: rb_backup_file.rc != 0
+
+        - name: "[RB-5.11] Restore database dari backup"
+          shell: |
+            BID=$(basename "{{ rb_backup_file.stdout | trim }}" | sed 's/_gitlab_backup.tar//')
+            echo "Restoring backup ID: $BID"
+            gitlab-backup restore BACKUP="$BID" force=yes 2>&1
+          register: rb_restore
+          async: 3600
+          poll: 30
+          failed_when: false
+
+        - name: "[RB-5.12] Start GitLab setelah rollback"
+          shell: gitlab-ctl start 2>&1
+          failed_when: false
+
+        - name: "[RB-5.13] Health check post-rollback"
+          uri:
+            url: "{{ gitlab_healthcheck_url }}"
+            status_code: [200]
+            timeout: 30
+            validate_certs: false
+          register: rb_health
+          retries: 15
+          delay: 20
+          until: rb_health.status == 200
+          failed_when: false
+
+        - name: "[RB-5.14] Status rollback"
+          debug:
+            msg: >-
+              ROLLBACK:
+              {{ '✅ BERHASIL — GitLab v' + (gitlab_rollback_version | default('?')) + ' aktif kembali'
+                 if rb_health.status | default(0) == 200
+                 else '❌ ROLLBACK GAGAL — Intervensi manual segera diperlukan!' }}
+
+        - name: "[RB-5.15] Fail jika rollback gagal"
+          fail:
+            msg: >
+              KRITIS: Patch GAGAL dan Rollback GAGAL.
+              Server GitLab dalam kondisi tidak stabil.
+              Lakukan intervensi manual segera!
+          when: rb_health.status | default(0) != 200
+
+    # ── CLEANUP AKHIR ─────────────────────────────────────────────────────────
+    - name: "[VFY-5.16] Disable maintenance mode"
+      shell: |
+        gitlab-rails runner "
+          Gitlab::CurrentSettings.update!(maintenance_mode: false)
+        " 2>&1 || true
+      failed_when: false
+
+    - name: "[VFY-5.17] Status akhir semua services"
+      shell: gitlab-ctl status 2>&1 || true
+      register: gl_status_final
+      changed_when: false
+
+    - name: "[VFY-5.18] Tampilkan status services akhir"
+      debug:
+        msg: "{{ gl_status_final.stdout_lines }}"
+
+    - name: "[VFY-5.19] Daftar backup yang dipertahankan ({{ backup_retention_days }} hari terakhir)"
+      shell: |
+        echo "=== Backup aktif (retensi {{ backup_retention_days }} hari) ==="
+        ls -lh {{ gitlab_backup_path }}/*.tar 2>/dev/null \
+          | awk '{print $6, $7, $8, $5, $9}' \
+          || echo "Tidak ada backup ditemukan"
+      register: backup_final_list
+      changed_when: false
+      failed_when: false
+
+    - name: "[VFY-5.20] Tampilkan daftar backup"
+      debug:
+        msg: "{{ backup_final_list.stdout_lines }}"
+
+    - name: "[VFY-5.21] Simpan laporan akhir ke Semaphore controller"
+      copy:
+        content: |
+          ══════════════════════════════════════════════
+          LAPORAN ROUTINE PATCH GITLAB
+          ══════════════════════════════════════════════
+          Host             : {{ inventory_hostname }}
+          Timestamp        : {{ ansible_date_time.iso8601 }}
+          OS               : {{ ansible_distribution | default('?') }} {{ ansible_distribution_version | default('') }}
+          Versi Sebelum    : {{ gitlab_rollback_version | default('N/A') }}
+          Versi Sesudah    : {{ gitlab_post_version | default('N/A') }}
+          Health Check     : {{ 'PASS' if health.status | default(0) == 200 else 'FAIL' }}
+          Readiness Check  : {{ 'PASS' if readiness.status | default(0) == 200 else 'FAIL' }}
+          Status Patch     : {{ 'SUKSES' if patch_ok else 'GAGAL' }}
+          Rollback         : {{ 'DIJALANKAN' if (not patch_ok and gitlab_rollback_on_failure | bool) else 'TIDAK' }}
+          Backup Retensi   : {{ backup_retention_days }} hari
+          ══════════════════════════════════════════════
+        dest: "/tmp/gitlab_routine_report_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
+      delegate_to: localhost
+      become: false
+      failed_when: false
