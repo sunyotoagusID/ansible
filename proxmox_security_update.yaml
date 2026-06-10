@@ -1,40 +1,24 @@
 ---
-- name: Proxmox 8 - Security & Critical Updates Only
-  hosts: proxmox_nodes
+- name: Proxmox 8 - Full System Dist-Upgrade
+  hosts: proxmox_nodes # Pastikan sesuai dengan nama inventory di Semaphore
   become: yes
   gather_facts: no
 
   tasks:
-    - name: Update APT cache
+    - name: Lakukan full dist-upgrade (Proxmox Standard)
       ansible.builtin.apt:
         update_cache: yes
-        cache_valid_time: 3600
-
-    - name: Simulasi dist-upgrade untuk mencari paket spesifik Security
-      ansible.builtin.shell: >
-        apt-get -s dist-upgrade | awk '/^Inst/ && /security/ {print $2}'
-      register: security_packages
-      changed_when: false
-
-    - name: Log paket security yang terdeteksi
-      ansible.builtin.debug:
-        msg: "Paket security yang akan di-install: {{ security_packages.stdout_lines | join(', ') }}"
-      when: security_packages.stdout_lines | length > 0
-
-    - name: Eksekusi instalasi Security Updates
-      ansible.builtin.apt:
-        name: "{{ security_packages.stdout_lines }}"
-        state: latest
-        only_upgrade: yes
-      when: security_packages.stdout_lines | length > 0
-      register: apt_result
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+      register: dist_upgrade_status
 
     - name: Cek flag system reboot
       ansible.builtin.stat:
         path: /var/run/reboot-required
       register: reboot_required
 
-    - name: Tampilkan peringatan jika reboot dibutuhkan
+    - name: Peringatan Kritis - Reboot Dibutuhkan
       ansible.builtin.debug:
-        msg: "⚠️ PENTING: Node ini membutuhkan REBOOT manual untuk menerapkan update (misal: libc atau kernel update)."
+        msg: "⚠️ PENTING: Node ini telah di-upgrade dan membutuhkan REBOOT manual untuk menerapkan kernel baru."
       when: reboot_required.stat.exists
