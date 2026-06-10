@@ -45,4 +45,4 @@
     - name: 7. Jeda Pengkondisian Kluster (Cooldown)
       ansible.builtin.pause:
         seconds: 15
-      comment: "Memberikan waktu bagi pve-cluster untuk sinkronisasi sebelum berpindah ke node berikutnya."
+      # Memberikan waktu bagi pve-cluster untuk sinkronisasi sebelum berpindah ke node berikutnya.
