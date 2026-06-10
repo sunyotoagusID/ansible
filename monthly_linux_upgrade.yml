@@ -1,0 +1,54 @@
+---
+- name: Monthly Full System Upgrade
+  hosts: all
+  become: yes
+  tasks:
+
+    # --- Bagian Debian / Ubuntu ---
+    - name: Full dist-upgrade (Debian)
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: yes
+        autoclean: yes
+        autoremove: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Check if reboot is required (Debian)
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: debian_reboot_required
+      when: ansible_os_family == "Debian"
+
+    # --- Bagian RHEL / AlmaLinux ---
+    - name: Full system upgrade (RHEL)
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        update_cache: yes
+        autoremove: yes
+      when: ansible_os_family == "RedHat"
+
+    - name: Install yum-utils for needs-restarting tool (RHEL)
+      ansible.builtin.dnf:
+        name: yum-utils
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Check if reboot is required (RHEL)
+      ansible.builtin.command: needs-restarting -r
+      register: rhel_reboot_required
+      failed_when: rhel_reboot_required.rc > 1
+      changed_when: false
+      when: ansible_os_family == "RedHat"
+
+    # --- Reboot Handler ---
+    - name: Reboot server if required
+      ansible.builtin.reboot:
+        msg: "Reboot triggered by Ansible after monthly updates"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+      when: >
+        (ansible_os_family == "Debian" and debian_reboot_required.stat.exists) or
+        (ansible_os_family == "RedHat" and rhel_reboot_required.rc == 1)
