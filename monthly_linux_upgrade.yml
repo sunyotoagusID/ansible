@@ -1,54 +1,44 @@
 ---
-- name: Monthly Full System Upgrade
-  hosts: all
+- name: Monthly Linux Full Upgrade (dist-upgrade)
+  hosts: linux_servers
   become: yes
   tasks:
-
-    # --- Bagian Debian / Ubuntu ---
-    - name: Full dist-upgrade (Debian)
+    # --- PROSES UPGRADE ---
+    - name: Debian/Ubuntu - Run dist-upgrade
       ansible.builtin.apt:
         upgrade: dist
         update_cache: yes
-        autoclean: yes
-        autoremove: yes
       when: ansible_os_family == "Debian"
 
-    - name: Check if reboot is required (Debian)
-      ansible.builtin.stat:
-        path: /var/run/reboot-required
-      register: debian_reboot_required
-      when: ansible_os_family == "Debian"
-
-    # --- Bagian RHEL / AlmaLinux ---
-    - name: Full system upgrade (RHEL)
+    - name: RHEL/AlmaLinux - Run Full Upgrade
       ansible.builtin.dnf:
-        name: "*"
+        name: '*'
         state: latest
         update_cache: yes
-        autoremove: yes
       when: ansible_os_family == "RedHat"
 
-    - name: Install yum-utils for needs-restarting tool (RHEL)
-      ansible.builtin.dnf:
-        name: yum-utils
-        state: present
-      when: ansible_os_family == "RedHat"
+    # --- DETEKSI KEBUTUHAN REBOOT ---
+    - name: Debian/Ubuntu - Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: debian_reboot
+      when: ansible_os_family == "Debian"
 
-    - name: Check if reboot is required (RHEL)
+    - name: RHEL/AlmaLinux - Check if reboot is required
       ansible.builtin.command: needs-restarting -r
-      register: rhel_reboot_required
-      failed_when: rhel_reboot_required.rc > 1
-      changed_when: false
+      register: rhel_reboot
+      failed_when: false
+      changed_when: rhel_reboot.rc == 1
       when: ansible_os_family == "RedHat"
 
-    # --- Reboot Handler ---
+    # --- EKSEKUSI REBOOT ---
     - name: Reboot server if required
       ansible.builtin.reboot:
-        msg: "Reboot triggered by Ansible after monthly updates"
+        msg: "Reboot initiated by Ansible for monthly kernel/system updates"
         connect_timeout: 5
-        reboot_timeout: 300
+        reboot_timeout: 600
         pre_reboot_delay: 0
         post_reboot_delay: 30
       when: >
-        (ansible_os_family == "Debian" and debian_reboot_required.stat.exists) or
-        (ansible_os_family == "RedHat" and rhel_reboot_required.rc == 1)
+        (debian_reboot.stat.exists | default(false)) or
+        (rhel_reboot.rc | default(0) == 1)
