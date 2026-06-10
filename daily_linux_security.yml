@@ -1,0 +1,26 @@
+---
+- name: Daily Security Updates untuk Ubuntu dan AlmaLinux
+  hosts: all
+  become: yes
+  tasks:
+
+    # --- Bagian Debian / Ubuntu ---
+    - name: Ensure unattended-upgrades is installed (Debian)
+      ansible.builtin.apt:
+        name: unattended-upgrades
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Run security updates only (Debian)
+      ansible.builtin.command: unattended-upgrade -d
+      register: debian_security_result
+      changed_when: "'Packages that will be upgraded' in debian_security_result.stdout"
+      when: ansible_os_family == "Debian"
+
+    # --- Bagian RHEL / AlmaLinux ---
+    - name: Run security updates only (RHEL)
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        security: true
+      when: ansible_os_family == "RedHat"
