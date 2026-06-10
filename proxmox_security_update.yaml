@@ -1,24 +1,48 @@
 ---
-- name: Proxmox 8 - Full System Dist-Upgrade
-  hosts: proxmox_nodes # Pastikan sesuai dengan nama inventory di Semaphore
+- name: Proxmox 8 - Full Sequential Dist-Upgrade
+  hosts: proxmox_nodes
   become: yes
-  gather_facts: no
+  gather_facts: yes
+  
+  # PENTING: Mengeksekusi node satu per satu untuk menjaga Quorum Cluster
+  serial: 1
 
   tasks:
-    - name: Lakukan full dist-upgrade (Proxmox Standard)
+    - name: 1. Validasi Koneksi dan Status Sudo
+      ansible.builtin.command: whoami
+      register: sudo_check
+      changed_when: false
+
+    - name: 2. Segarkan Cache Repositori (APT Update)
       ansible.builtin.apt:
         update_cache: yes
-        upgrade: dist
-        autoremove: yes
-        autoclean: yes
-      register: dist_upgrade_status
+      register: apt_update_result
 
-    - name: Cek flag system reboot
+    - name: 3. Eksekusi Full Dist-Upgrade (Non-Interactive)
+      ansible.builtin.apt:
+        upgrade: dist
+        force_apt_get: yes
+        dpkg_options: 'force-confold,force-confdef'
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: dist_upgrade_result
+
+    - name: 4. Catat Hasil Log Upgrade ke Semaphore
+      ansible.builtin.debug:
+        msg: "Status Upgrade pada {{ inventory_hostname }}: {{ dist_upgrade_result.stdout | default('Tidak ada paket yang diperbarui') }}"
+      when: dist_upgrade_result.changed
+
+    - name: 5. Periksa Apakah Sistem Membutuhkan Reboot
       ansible.builtin.stat:
         path: /var/run/reboot-required
-      register: reboot_required
+      register: reboot_flag
 
-    - name: Peringatan Kritis - Reboot Dibutuhkan
+    - name: 6. Evaluasi Status Kebutuhan Reboot
       ansible.builtin.debug:
-        msg: "⚠️ PENTING: Node ini telah di-upgrade dan membutuhkan REBOOT manual untuk menerapkan kernel baru."
-      when: reboot_required.stat.exists
+        msg: "⚠️ PERINGATAN: Node {{ inventory_hostname }} sukses diperbarui, tetapi MEMBUTUHKAN REBOOT MANUAl (Kernel/Core Library diperbarui)."
+      when: reboot_flag.stat.exists
+
+    - name: 7. Jeda Pengkondisian Kluster (Cooldown)
+      ansible.builtin.pause:
+        seconds: 15
+      comment: "Memberikan waktu bagi pve-cluster untuk sinkronisasi sebelum berpindah ke node berikutnya."
