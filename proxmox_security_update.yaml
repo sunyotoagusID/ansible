@@ -1,8 +1,8 @@
 ---
-- name: Update proxmox nodes
+- name: Proxmox 8 - Security & Critical Updates Only
   hosts: proxmox_nodes
   become: yes
-  gather_facts: no # Mempercepat eksekusi
+  gather_facts: no
 
   tasks:
     - name: Update APT cache
@@ -16,7 +16,7 @@
       register: security_packages
       changed_when: false
 
-    - name: Log paket security yang terdeteksi ke Semaphore
+    - name: Log paket security yang terdeteksi
       ansible.builtin.debug:
         msg: "Paket security yang akan di-install: {{ security_packages.stdout_lines | join(', ') }}"
       when: security_packages.stdout_lines | length > 0
@@ -36,5 +36,5 @@
 
     - name: Tampilkan peringatan jika reboot dibutuhkan
       ansible.builtin.debug:
-        msg: "⚠️ PENTING: Node Proxmox ini membutuhkan REBOOT untuk menerapkan update (misal: libc atau kernel update)."
+        msg: "⚠️ PENTING: Node ini membutuhkan REBOOT manual untuk menerapkan update (misal: libc atau kernel update)."
       when: reboot_required.stat.exists
