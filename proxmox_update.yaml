@@ -1,6 +1,6 @@
 ---
-- name: Update Proxmox Server
-  hosts: proxmox_servers
+- name: Update proxmox nodes
+  hosts: proxmox_nodes
   become: yes
   gather_facts: no # Mempercepat eksekusi
 
