@@ -1,25 +1,23 @@
 ---
-- name: Universal OS Lifecycle & Patch Management
-  # Menargetkan seluruh node di inventory. 
-  # Gunakan kolom 'Limit' di Semaphore untuk menargetkan grup spesifik (misal: rhel_servers)
-  hosts: all
+- name: Daily Linux Security & Patch Management
+  # Menargetkan grup linux_servers dari inventory (mencakup debian_servers & rhel_servers)
+  hosts: linux_servers
   become: yes
   gather_facts: yes
   
-  # Eksekusi satu per satu untuk menjaga stabilitas infrastruktur
+  # Eksekusi satu per satu untuk menjaga ketersediaan layanan
   serial: 1
 
   tasks:
-    - name: 1. Validasi Koneksi dan Hak Akses Sudo
+    - name: 1. Validasi Koneksi
       ansible.builtin.command: whoami
       register: sudo_check
       changed_when: false
 
     # ==========================================
-    # BLOK DEBIAN FAMILY (Ubuntu, Proxmox VE, PBS)
-    # Target: debian_servers, proxmox_nodes, proxmox_backup, gitlab_server (jika debian)
+    # BLOK DEBIAN FAMILY (Ubuntu/Debian)
     # ==========================================
-    - name: 2A. [Debian/Proxmox] Segarkan Cache & Full Dist-Upgrade
+    - name: 2A. [Debian] Segarkan Cache & Full Dist-Upgrade
       ansible.builtin.apt:
         update_cache: yes
         upgrade: dist
@@ -30,23 +28,22 @@
       register: apt_upgrade_result
       when: ansible_os_family == "Debian"
 
-    - name: 2B. [Debian/Proxmox] Periksa Kebutuhan Reboot
+    - name: 2B. [Debian] Periksa Kebutuhan Reboot
       ansible.builtin.stat:
         path: /var/run/reboot-required
       register: debian_reboot_flag
       when: ansible_os_family == "Debian"
 
     # ==========================================
-    # BLOK REDHAT FAMILY (AlmaLinux 9)
-    # Target: rhel_servers (SIEM, PDF, Netmon, passman, HAProxy)
+    # BLOK REDHAT FAMILY (AlmaLinux/RHEL)
     # ==========================================
-    - name: 3A. [AlmaLinux] Pastikan utilitas dnf-utils terinstal
+    - name: 3A. [RHEL] Install yum-utils (Untuk deteksi reboot)
       ansible.builtin.dnf:
-        name: dnf-utils
+        name: yum-utils
         state: present
       when: ansible_os_family == "RedHat"
 
-    - name: 3B. [AlmaLinux] Eksekusi DNF System Upgrade
+    - name: 3B. [RHEL] Eksekusi DNF System Upgrade
       ansible.builtin.dnf:
         name: "*"
         state: latest
@@ -54,27 +51,26 @@
       register: dnf_upgrade_result
       when: ansible_os_family == "RedHat"
 
-    - name: 3C. [AlmaLinux] Periksa Kebutuhan Reboot
+    - name: 3C. [RHEL] Periksa Kebutuhan Reboot
       ansible.builtin.command: dnf needs-restarting -r
       register: rhel_reboot_flag
       failed_when: false
       changed_when: false
       when: ansible_os_family == "RedHat"
-      # dnf needs-restarting -r: Exit code 1 berarti butuh reboot, 0 berarti aman.
+      # dnf needs-restarting -r merespons exit code 1 jika butuh reboot, 0 jika tidak.
 
     # ==========================================
     # EVALUASI & NOTIFIKASI
     # ==========================================
     - name: 4. Evaluasi Status Kebutuhan Reboot (Universal)
       ansible.builtin.debug:
-        msg: >
-          ⚠️ PERINGATAN: Node {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }}) 
-          telah sukses diperbarui. Node ini MEMBUTUHKAN REBOOT MANUAL untuk menerapkan kernel/library baru.
+        msg: "⚠️ PERINGATAN: Node {{ inventory_hostname }} ({{ ansible_distribution }}) sukses diperbarui, tetapi MEMBUTUHKAN REBOOT MANUAL."
       when: >
         (debian_reboot_flag.stat.exists | default(false)) or
         (rhel_reboot_flag.rc | default(0) == 1)
 
     - name: 5. Jeda Transisi (Cooldown) Antar Node
       ansible.builtin.pause:
-        seconds: 15
-      comment: "Memberikan waktu stabilitas network dan IO disk sebelum memproses node berikutnya di antrean."
+        seconds: 10
+      # Parameter 'comment' dihapus dan diganti dengan komentar YAML standar '#'.
+      # Jeda ini memberikan waktu stabilitas sebelum Ansible memproses node selanjutnya.
