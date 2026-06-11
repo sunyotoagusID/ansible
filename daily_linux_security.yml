@@ -1,25 +1,80 @@
 ---
-- name: Daily Linux Security Updates ONLY
-  hosts: linux_servers
+- name: Universal OS Lifecycle & Patch Management
+  # Menargetkan seluruh node di inventory. 
+  # Gunakan kolom 'Limit' di Semaphore untuk menargetkan grup spesifik (misal: rhel_servers)
+  hosts: all
   become: yes
+  gather_facts: yes
+  
+  # Eksekusi satu per satu untuk menjaga stabilitas infrastruktur
+  serial: 1
+
   tasks:
-    - name: RHEL/AlmaLinux - Install Security Updates
-      ansible.builtin.dnf:
-        name: '*'
-        security: yes
-        state: latest
+    - name: 1. Validasi Koneksi dan Hak Akses Sudo
+      ansible.builtin.command: whoami
+      register: sudo_check
+      changed_when: false
+
+    # ==========================================
+    # BLOK DEBIAN FAMILY (Ubuntu, Proxmox VE, PBS)
+    # Target: debian_servers, proxmox_nodes, proxmox_backup, gitlab_server (jika debian)
+    # ==========================================
+    - name: 2A. [Debian/Proxmox] Segarkan Cache & Full Dist-Upgrade
+      ansible.builtin.apt:
         update_cache: yes
+        upgrade: dist
+        force_apt_get: yes
+        dpkg_options: 'force-confold,force-confdef'
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: apt_upgrade_result
+      when: ansible_os_family == "Debian"
+
+    - name: 2B. [Debian/Proxmox] Periksa Kebutuhan Reboot
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: debian_reboot_flag
+      when: ansible_os_family == "Debian"
+
+    # ==========================================
+    # BLOK REDHAT FAMILY (AlmaLinux 9)
+    # Target: rhel_servers (SIEM, PDF, Netmon, passman, HAProxy)
+    # ==========================================
+    - name: 3A. [AlmaLinux] Pastikan utilitas dnf-utils terinstal
+      ansible.builtin.dnf:
+        name: dnf-utils
+        state: present
       when: ansible_os_family == "RedHat"
 
-    - name: Debian/Ubuntu - Ensure unattended-upgrades is installed
-      ansible.builtin.apt:
-        name: unattended-upgrades
-        state: present
+    - name: 3B. [AlmaLinux] Eksekusi DNF System Upgrade
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
         update_cache: yes
-      when: ansible_os_family == "Debian"
+      register: dnf_upgrade_result
+      when: ansible_os_family == "RedHat"
 
-    - name: Debian/Ubuntu - Run Security Updates via unattended-upgrades
-      ansible.builtin.command: unattended-upgrade -d
-      register: ubuntu_security
-      changed_when: "'Packages that will be upgraded' in ubuntu_security.stdout"
-      when: ansible_os_family == "Debian"
+    - name: 3C. [AlmaLinux] Periksa Kebutuhan Reboot
+      ansible.builtin.command: dnf needs-restarting -r
+      register: rhel_reboot_flag
+      failed_when: false
+      changed_when: false
+      when: ansible_os_family == "RedHat"
+      # dnf needs-restarting -r: Exit code 1 berarti butuh reboot, 0 berarti aman.
+
+    # ==========================================
+    # EVALUASI & NOTIFIKASI
+    # ==========================================
+    - name: 4. Evaluasi Status Kebutuhan Reboot (Universal)
+      ansible.builtin.debug:
+        msg: >
+          ⚠️ PERINGATAN: Node {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }}) 
+          telah sukses diperbarui. Node ini MEMBUTUHKAN REBOOT MANUAL untuk menerapkan kernel/library baru.
+      when: >
+        (debian_reboot_flag.stat.exists | default(false)) or
+        (rhel_reboot_flag.rc | default(0) == 1)
+
+    - name: 5. Jeda Transisi (Cooldown) Antar Node
+      ansible.builtin.pause:
+        seconds: 15
+      comment: "Memberikan waktu stabilitas network dan IO disk sebelum memproses node berikutnya di antrean."
